@@ -39,7 +39,3 @@ library(NetClusterSim)
 
 ---
 
-If you run into any issues, feel free to let me know.
-
-Best,
-Ting-Fang
