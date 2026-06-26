@@ -1,0 +1,149 @@
+---
+title: "Simulation - Cluster-based"
+output: pdf_document
+date: "2026-01-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(inferference)
+library(tinytex)
+library(dplyr)
+library(NetClusterSim)
+```
+
+## Define or generate the population $\mathcal{I}$ and interference structure $M$. 
+
+We generate a population $\mathcal{I}$ of individuals partitioned into clusters, assuming that interference occurs only within clusters. Let $K = 1000$ denote the number of clusters. Cluster sizes $\{n_k\}_{k=1}^K$ are independently drawn from a Poisson distribution,
+$$n_k \sim \text{Pois}(\lambda), \quad \lambda = 10,$$
+and clusters with $n_k \le 1$ are excluded to ensure that each individual has a nonempty interference set. The remaining clusters are re-indexed consecutively. For each individual $i \in \mathcal{I}$, the interference set $\mathcal{N}_i$ consists of all other individuals in the same cluster, with cardinality $|\mathcal{N}_i| = n_{c(i)} - 1$, where $c(i)$ denotes the cluster membership of individual $i$. In addition, we independently generate a binary individual-level covariate
+$$L_i \sim \text{Bernoulli}(0.4), \quad i \in \mathcal{I}.$$
+
+
+```{r}
+dat.cluster <- build_cluster(K = 1000, dist = "poisson", lambda = 10, 
+                             size = NULL, prob = NULL, min_size = 2,
+                             max_size = NULL, fixed_size = NULL,
+                             seed = 999)
+
+dat.cluster$L_i <- rbinom(nrow(dat.cluster), 1, 0.4)
+```
+
+## Simulate $Y(a_i, a_{\mathcal{N}_i})$.
+The outcome-generating mechanism corresponds to a binary outcome and is
+specified using the aggregated exposure mapping
+$\bar a_{\mathcal{N}_i}$:
+
+$$Y(a_i, a_{\mathcal{N}_i}) = Y(a_i, \bar a_{\mathcal{N}_i})
+= {\rm logit}^{-1}(0.5 - 0.5 a_i - 0.5 \bar a_{\mathcal{N}_i}
++ 0.25 a_i \bar a_{\mathcal{N}_i} + 0.25 L_i).$$
+
+Coefficients are chosen to induce both direct and spillover effects and to allow for interaction between individual and peer exposure; their specific values are not substantively interpreted.
+
+## Simulate $A_i$ and $\bar{A}_{\mathcal{N}_i}$.
+Given the treatment assignment mechanism, we generate a single realization of the treatment vector $\mathbf{A} = (A_1,\ldots,A_n)$. For each individual $i$, the aggregated exposure $\bar{A}_{\mathcal{N}_i}$ is defined as the mean treatment status among individuals in $i$’s interference set, excluding $i$ themself. 
+
+We assume that treatment is assigned according to the following individual-level model:
+$$A_i = {\rm logit}^{-1}(-0.5+L_i+\epsilon_i)$$
+where $L_i$ is an observed individual-level covariate and $\epsilon_i \sim \mathcal{N}(0, 0.3^2)$ is an independent error term.
+
+```{r}
+sim.cluster <- simulate_cluster_outcome(dat.cluster, 
+                                        outcome_intercept = 0.5, 
+                                        beta_a = -0.5, beta_abar = -0.5, 
+                                        beta_a_abar = 0.25, 
+                                        outcome_covars = "L_i",
+                                        outcome_coefs = 0.25, 
+                                        propensity_intercept = -0.5,
+                                        treatment_covars = "L_i", 
+                                        treatment_coefs = 1)
+PO = sim.cluster[[1]]
+dat.cluster = sim.cluster[[2]]
+```
+
+$\texttt{PO}$ is a list of matrices, with each matrix corresponding to an individual $i$ and encoding that individual’s potential outcomes under different treatment and interference scenarios. Within each matrix, the rows index the individual’s own treatment status, with the first row representing individual $i$ not treated ($A_i = 0$) and the second row representing individual $i$ treated ($A_i = 1$). The columns index the level of exposure to interference, where column $k$ corresponds to the case in which exactly $k$ individuals in $i$’s interference set are treated, for $k = 0, 1, \ldots, N_i$, with $N_i$ denoting the size of the interference set for individual $i$.
+
+$\texttt{dat.cluster}$ is observed outcome using consistency $Y_{{\rm obs},i} = PO_i[A_i + 1, A_{\mathcal{N}_i} + 1]$.
+
+```{r}
+PO[[1]]
+PO[[2]]
+head(dat.cluster)
+```
+
+## Calculate true causal effects
+
+The object $\texttt{PO}$ stores individual-level potential outcomes under interference. For each individual $i$, $\texttt{PO}[[i]]$ is a $2 \times (N_i+1)$ matrix, where rows correspond to the individual’s own treatment status ($A_i = 0$ or $A_i = 1$), and columns correspond to the number of treated individuals in $i$’s interference set ($k = 0, \ldots, N_i$).
+
+To compute **true causal estimands** under a Bernoulli allocation policy with treatment probability $\alpha$, we average potential outcomes over the distribution of the number of treated individuals in the interference set, induced by independently assigning treatment to each member with probability $\alpha$. For fixed $(a, \alpha)$, the individual-level average potential outcome is defined as
+$$\bar{Y}_i(a_i=a, \alpha)=\sum_{k=0}^{|\mathcal{N}_i|} {\rm PO}_i[a+1, k]\binom{|\mathcal{N}_i|}{k}\alpha^k(1-\alpha)^{|\mathcal{N}_i|-k}.$$
+
+where $\mathcal{N}_i$ denotes the interference set of individual $i$.
+
+We assume the interference sets form a partition of the population into clusters $C_1, C_2, \ldots, C_K$, where $K$ is the number of clusters. The population-level average potential outcome is then defined as
+$$\bar{Y}(a, \alpha)=\frac{1}{K}\sum_{\nu=1}^K \frac{1}{|C_\nu|}\sum_{i \in C_\nu}\bar{Y}_i(a_i=a, \alpha).$$
+
+The functions below implement these quantities directly from $\texttt{sim.cluster}$.
+```{r}
+true_val = simulate_cluster_true_effect(sim.cluster, allocations = c(0.25, 0.5, 0.75))
+```
+
+## Estimate the spillover effect using inferference.
+
+```{r}
+model <- interference(
+  Y_obs | Ai ~ L_i | cluster_id,
+  allocations = c(0.25, 0.5),
+  data = dat.cluster,
+  model_method = "glm",
+  model_options = list(family = binomial(link = "logit")))
+
+model$estimates
+```
+
+## Simulation framework to evaluate and compare true versus estimated spillover (indirect) effects.
+We conduct a simulation study to evaluate the performance of estimators for spillover (indirect) effects under cluster-level interference. In each of 500 iterations, we generated a clustered dataset based on a fixed interference structure. For each simulated dataset, we computed the true indirect effect under two allocation strategies (0.25 vs. 0.5) using the known data-generating mechanism. We then estimated the corresponding effect using a regression-based approach that accounts for interference within clusters. Across simulations, we recorded the true effect, point estimate, standard error, and confidence interval, enabling assessment of bias, variability, and interval coverage of the estimator.
+```{r}
+interference.cluster <- build_cluster(K = 100, dist = "poisson", lambda = 10, 
+                                      size = NULL, prob = NULL, min_size = 2,
+                                      max_size = NULL, fixed_size = NULL,
+                                      seed = 999)
+iter <- 500
+sim.results <- data.frame(true_val = numeric(iter), estimate = numeric(iter),
+                          std.error = numeric(iter), conf.low = numeric(iter),
+                          conf.high = numeric(iter))
+for (i in 1:iter){
+  dat.cluster <- data.frame(interference.cluster, 
+                            L_i = rbinom(nrow(interference.cluster), 1, 0.4))
+  sim.cluster <- simulate_cluster_outcome(dat.cluster, 
+                                          outcome_intercept = 0.5, 
+                                          beta_a = -0.5, beta_abar = -0.5, 
+                                          beta_a_abar = 0.25, 
+                                          outcome_covars = "L_i",
+                                          outcome_coefs = 0.25, 
+                                          propensity_intercept = -0.5,
+                                          treatment_covars = "L_i", 
+                                          treatment_coefs = 1)
+  dat.cluster = sim.cluster[[2]]
+  true_val = simulate_cluster_true_effect(sim.cluster, allocations = c(0.25, 0.5))
+  model <- interference(Y_obs | Ai ~ L_i | cluster_id, allocations = c(0.25, 0.5),
+                        data = dat.cluster, model_method = "glm",
+                        model_options = list(family = binomial(link = "logit")))
+
+  estimate_val <- subset(model$estimates, (alpha1 == 0.25 & alpha2 == 0.5) & 
+                           (effect == "indirect" & trt1+trt2 == 0))
+  sim.results <- rbind(sim.results, c(true_val$IE[, "true_effect"], 
+                                      estimate_val$estimate, 
+                                      estimate_val$std.error, 
+                                      estimate_val$conf.low, 
+                                      estimate_val$conf.high))
+}
+```
+
+```{r}
+avg.bias = mean(sim.results$true_val - sim.results$estimate)
+ECP = mean(between(sim.results$true_val, sim.results$conf.low, sim.results$conf.high))
+avg.bias
+ECP
+```
+

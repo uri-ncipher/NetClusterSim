@@ -1,0 +1,233 @@
+---
+title: "Simulation - Network-based"
+output: pdf_document
+date: "2026-04-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(inferference)
+library(tinytex)
+library(dplyr)
+library(igraph)
+library(NetClusterSim)
+```
+
+## Define the population $\mathcal{I}$ and interference structure $M$.
+
+For the network example, we use a network-derived interference structure from the Transmission Reduction Intervention Project (TRIP). The data provide an observed ego-alter edge list, where `EGO_ID` identifies the focal individual and `ALTER_ID` identifies that individual's network contact.
+
+We use the observed ego-alter pairs to construct the network with `build_network()`. Interference is assumed to occur through immediate observed network neighbors.
+
+For individual $i$, the interference set $\mathcal{N}_i$ consists of the individuals connected to $i$ in the observed TRIP network. Thus, $|\mathcal{N}_i|$ is the observed number of network neighbors of individual $i$.
+
+After generating the edge list, we use the package function `build_network()` to create the network object. We also independently generate a binary individual-level covariate
+$$L_i \sim \text{Bernoulli}(0.4), \quad i \in \mathcal{I}.$$
+
+```{r}
+
+set.seed(999)
+
+load("/Users/dingyudupan/Desktop/39059-0001-Data.rda")
+
+df <- da39059.0001
+
+net.network <- build_network(
+  x1 = df$EGO_ID,
+  x2 = df$ALTER_ID
+)
+
+# create network_id from observed connected components
+net.network$data$network_id <- igraph::components(net.network$net0)$membership[
+  net.network$data$id
+]
+
+net.network$data$L_i <- rbinom(nrow(net.network$data), 1, 0.4)
+
+
+
+```
+
+## Simulate $Y(a_i, a_{\mathcal{N}_i})$.
+
+The outcome-generating mechanism corresponds to a binary outcome and is specified using the aggregated network-neighbor exposure mapping $\bar a_{\mathcal{N}_i}$:
+
+$$Y(a_i, a_{\mathcal{N}_i}) = Y(a_i, \bar a_{\mathcal{N}_i})
+= {\rm logit}^{-1}(0.5 - 0.5 a_i - 0.5 \bar a_{\mathcal{N}_i}
++ 0.25 a_i \bar a_{\mathcal{N}_i} + 0.25 L_i).$$
+
+Coefficients are chosen to induce both direct and spillover effects and to allow for interaction between individual and peer exposure; their specific values are not substantively interpreted.
+
+## Simulate $A_i$ and $\bar{A}_{\mathcal{N}_i}$.
+
+Given the treatment assignment mechanism, we generate a single realization of the treatment vector $\mathbf{A} = (A_1,\ldots,A_n)$. For each individual $i$, the aggregated exposure $\bar{A}_{\mathcal{N}_i}$ is defined as the mean treatment status among individuals in $i$'s network-neighbor interference set, excluding $i$ themself.
+
+We assume that treatment is assigned according to the following individual-level model:
+$$A_i \sim \text{Bernoulli}\{ {\rm logit}^{-1}(-0.5 + L_i) \}.$$
+
+```{r}
+sim.network <- simulate_network_outcome(
+  net.network,
+  outcome_intercept = 0.5,
+  beta_a = -0.5,
+  beta_abar = -0.5,
+  beta_a_abar = 0.25,
+  outcome_covars = "L_i",
+  outcome_coefs = 0.25,
+  propensity_intercept = -0.5,
+  treatment_covars = "L_i",
+  treatment_coefs = 1
+)
+
+PO <- sim.network[[1]]
+dat.network <- sim.network[[2]]
+```
+
+$\texttt{PO}$ is a list of matrices, with each matrix corresponding to an individual $i$ and encoding that individual's potential outcomes under different treatment and interference scenarios. Within each matrix, the rows index the individual's own treatment status, with the first row representing individual $i$ not treated ($A_i = 0$) and the second row representing individual $i$ treated ($A_i = 1$). The columns index the level of exposure to interference, where column $k$ corresponds to the case in which exactly $k$ individuals in $i$'s network-neighbor interference set are treated, for $k = 0, 1, \ldots, N_i$, with $N_i$ denoting the size of the interference set for individual $i$.
+
+$\texttt{dat.network}$ is observed outcome using consistency $Y_{{\rm obs},i} = PO_i[A_i + 1, A_{\mathcal{N}_i} + 1]$.
+
+```{r}
+PO[[1]]
+PO[[2]]
+head(dat.network)
+```
+
+## Calculate true causal effects
+
+The object $\texttt{PO}$ stores individual-level potential outcomes under network interference. For each individual $i$, $\texttt{PO}[[i]]$ is a $2 \times (N_i+1)$ matrix, where rows correspond to the individual's own treatment status ($A_i = 0$ or $A_i = 1$), and columns correspond to the number of treated individuals in $i$'s network-neighbor interference set ($k = 0, \ldots, N_i$).
+
+To compute true causal estimands under a Bernoulli allocation policy with treatment probability $\alpha$, we average potential outcomes over the distribution of the number of treated individuals in the network-neighbor interference set, induced by independently assigning treatment to each neighbor with probability $\alpha$. For fixed $(a, \alpha)$, the individual-level average potential outcome is defined as
+$$\bar{Y}_i(a_i=a, \alpha)=\sum_{k=0}^{|\mathcal{N}_i|} {\rm PO}_i[a+1, k]\binom{|\mathcal{N}_i|}{k}\alpha^k(1-\alpha)^{|\mathcal{N}_i|-k}.$$
+
+The package function below implements these quantities directly from $\texttt{sim.network}$.
+
+```{r}
+true_val <- simulate_network_true_effect(
+  sim.network,
+  allocations = c(0.25, 0.5, 0.75)
+)
+
+true_val
+```
+
+## Estimate the spillover effect using inferference.
+
+The group variable in `interference()` is `network_id`, which identifies the disconnected network component. There are no edges between different `network_id` groups.
+
+```{r}
+model <- interference(
+  Y_obs | Ai ~ L_i | network_id,
+  allocations = c(0.25, 0.5),
+  data = dat.network,
+  model_method = "glm",
+  model_options = list(family = binomial(link = "logit"))
+)
+
+model$estimates
+```
+
+## Simulation framework to evaluate and compare true versus estimated spillover (indirect) effects.
+
+We conduct a simulation study to evaluate the performance of estimators for spillover effects under network interference. In each of 500 iterations, we use a fixed random network structure, regenerate the covariate, treatment, potential outcomes, and observed outcome, compute the true indirect effect under two allocation strategies $(0.25$ vs. $0.5)$ using the known data-generating mechanism, and estimate the corresponding indirect effect using `inferference()`.
+
+```{r}
+
+set.seed(999)
+
+# load the dataset
+load("/Users/dingyudupan/Desktop/39059-0001-Data.rda")
+
+# define the dataset
+df <- da39059.0001
+
+# use observed ego-alter pairs from TRIP
+network_edges <- data.frame(
+  x1 = df$EGO_ID,
+  x2 = df$ALTER_ID
+)
+
+# build observed TRIP network
+interference.network <- build_network(
+  x1 = network_edges$x1,
+  x2 = network_edges$x2
+)
+
+# define network_id using connected components of the built network
+interference.network$data$network_id <- igraph::components(interference.network$net0)$membership[
+  interference.network$data$id
+]
+
+iter <- 500
+
+sim.results <- data.frame(
+  true_val = numeric(iter),
+  estimate = numeric(iter),
+  std.error = numeric(iter),
+  conf.low = numeric(iter),
+  conf.high = numeric(iter)
+)
+
+for (i in 1:iter) {
+  net.i <- interference.network
+
+  # generate individual-level covariate
+  net.i$data$L_i <- rbinom(nrow(net.i$data), 1, 0.4)
+
+  sim.network <- simulate_network_outcome(
+    net.i,
+    outcome_intercept = 0.5,
+    beta_a = -0.5,
+    beta_abar = -0.5,
+    beta_a_abar = 0.25,
+    outcome_covars = "L_i",
+    outcome_coefs = 0.25,
+    propensity_intercept = -0.5,
+    treatment_covars = "L_i",
+    treatment_coefs = 1
+  )
+
+  dat.network <- sim.network[[2]]
+
+  true_val <- simulate_network_true_effect(
+    sim.network,
+    allocations = c(0.25, 0.5)
+  )
+
+  model <- interference(
+    Y_obs | Ai ~ L_i | network_id,
+    allocations = c(0.25, 0.5),
+    data = dat.network,
+    model_method = "glm",
+    model_options = list(family = binomial(link = "logit"))
+  )
+
+  estimate_val <- subset(
+    model$estimates,
+    alpha1 == 0.25 & alpha2 == 0.5 &
+      effect == "indirect" & trt1 == 0 & trt2 == 0
+  )
+
+  true_ie <- subset(
+    true_val$IE,
+    alpha1 == 0.25 & alpha0 == 0.5
+  )$true_effect
+
+  sim.results[i, ] <- c(
+    true_ie,
+    estimate_val$estimate,
+    estimate_val$std.error,
+    estimate_val$conf.low,
+    estimate_val$conf.high
+  )
+}
+
+```
+
+```{r}
+avg.bias <- mean(sim.results$true_val - sim.results$estimate)
+ECP <- mean(between(sim.results$true_val, sim.results$conf.low, sim.results$conf.high))
+
+avg.bias
+ECP
+```
